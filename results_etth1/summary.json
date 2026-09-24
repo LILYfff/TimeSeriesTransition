@@ -1,0 +1,16 @@
+{
+  "n_windows": 1428,
+  "n_valid_windows": 1428,
+  "mean_coef_cosine_similarity": 0.7850287052170312,
+  "median_coef_cosine_similarity": 0.8029102493698421,
+  "mean_transfer_mse": 6.153640156042738,
+  "mean_persistence_mse": 0.15559589011189565,
+  "similarity_vs_transfer_mse_corr": -0.030884388454061662,
+  "mean_transfer_skill": -11.672251645824014,
+  "similarity_vs_transfer_skill_corr": 0.030688383752017843,
+  "mean_random_mse": 2.1443509394277074,
+  "transfer_beats_random_ratio": 0.8485915492957746,
+  "mean_random_skill": -27.55162271093193,
+  "mean_retrieved_mse": 1.3023239197060539,
+  "mean_retrieved_skill": -16.260594829254558
+}
