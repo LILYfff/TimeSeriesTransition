@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 
 import math
 import numpy as np
+import os
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -360,27 +361,14 @@ class DeepForecastingModelBase(ModelBase):
                     target_mark.to(device),
                 )
                 exog_future = target[:, -config.horizon :, series_dim:]
-                if hct_index is None:
-                     out_loss = self._process(
-                        input,
-                        target,
-                        input_mark,
-                        target_mark,
-                        exog_future,
-                    )
-                else:
-                     out_loss = self._process(
-                        input,
-                        target,
-                        input_mark,
-                        target_mark,
-                        exog_future,
-                        hct_index=hct_index,
-                     )
 
-
-
-
+                out_loss = self._process(
+                    input,
+                    target,
+                    input_mark,
+                    target_mark,
+                    exog_future,
+                )
                 additional_loss = 0
                 output = out_loss["output"]
                 if "additional_loss" in out_loss:
@@ -538,6 +526,33 @@ class DeepForecastingModelBase(ModelBase):
             drop_last=train_drop_last,
             return_index=(getattr(config, "hct_mode", 0) > 0),
         )
+        # ============================================================
+        # HCT retrieval debug
+        # Only used to verify historical transition retrieval.
+        # No HCT information is injected into the model at this stage.
+        # ============================================================
+        hct_debug_retriever = None
+        hct_debug_series = None
+
+        if getattr(config, "hct_mode", 0) > 0:
+            from ts_benchmark.baselines.dag.hct_retrieval import HCTRetriever
+
+            hct_debug_retriever = HCTRetriever(
+                seq_len=config.seq_len,
+                pred_len=config.pred_len,
+                series_dim=series_dim,
+                topk=getattr(config, "hct_topk", 5),
+                stride=getattr(config, "hct_memory_stride", 12),
+            )
+
+            # train_data has already been normalized here.
+            # Shape: [N, endogenous + exogenous]
+            hct_debug_series = torch.tensor(
+                train_data.values,
+                dtype=torch.float32,
+            )
+
+
         # Define optimizer
         optimizer = self._init_optimizer(CovariateFusion=self.CovariateFusion)
 
@@ -558,7 +573,7 @@ class DeepForecastingModelBase(ModelBase):
                 p.numel() for p in self.CovariateFusion.parameters() if p.requires_grad
             )
         print(f"Total trainable parameters: {total_params}")
-
+        hct_debug_printed = False
         for epoch in range(config.num_epochs):
             self.model.train()
             if self.CovariateFusion is not None:
@@ -581,26 +596,209 @@ class DeepForecastingModelBase(ModelBase):
                         target_mark,
                     ) = batch
                     hct_index = None
-                
+            
+                # ============================================================
+                # HCT B1 retrieval verification
+                # ============================================================
+                if (
+                    getattr(config, "hct_mode", 0) == 1
+                    and hct_index is not None
+                    and hct_debug_retriever is not None
+                    and not hct_debug_printed
+                ):
+                    # The DataLoader is shuffled, so the first item in a batch
+                    # may be too early to have a complete historical A -> B.
+                    # Find the first eligible query in this batch.
+                    for q_tensor in hct_index:
+                        query_start = int(q_tensor.item())
+
+                        # At least one complete historical transition must exist:
+                        # A: [j, j + L)
+                        # B: [j + L, j + L + H)
+                        # and B_end <= C_start.
+                        if query_start < config.seq_len + config.pred_len:
+                            continue
+
+                        # ----------------------------------------------------
+                        # 1) Retrieve the actual Top-K transition records.
+                        #    This object is needed for printing time ranges,
+                        #    causal checks, and visualization.
+                        # ----------------------------------------------------
+                        retrieved = hct_debug_retriever.retrieve(
+                            full_series=hct_debug_series,
+                            query_start=query_start,
+                        )
+
+                        if retrieved is None or len(retrieved) == 0:
+                            continue
+
+                        # ----------------------------------------------------
+                        # 2) Convert the same Top-K retrieval result to tensors.
+                        #    Expected for ETTh1, H=96, K=5:
+                        #      hist_src   [5, 96, 1]
+                        #      hist_fut   [5, 96, 1]
+                        #      hist_score [5]
+                        # ----------------------------------------------------
+                        (
+                            hist_src,
+                            hist_fut,
+                            hist_score,
+                            hist_valid,
+                        ) = hct_debug_retriever.retrieve_tensors(
+                            full_series=hct_debug_series,
+                            query_start=query_start,
+                        )
+
+                        print("\n")
+                        print("=" * 70)
+                        print("HCT B1 RETRIEVAL CHECK")
+                        print("=" * 70)
+                        print(f"hct_mode      : {config.hct_mode}")
+                        print(f"seq_len (L)   : {config.seq_len}")
+                        print(f"pred_len (H)  : {config.pred_len}")
+                        print(f"top-k         : {len(retrieved)}")
+                        print(f"memory stride : {config.hct_memory_stride}")
+                        print()
+                        print(f"Query C start : {query_start}")
+                        print(
+                            f"Query C range : "
+                            f"[{query_start}, {query_start + config.seq_len})"
+                        )
+                        print("-" * 70)
+
+                        all_causal = True
+
+                        for rank, item in enumerate(retrieved, start=1):
+                            causal_ok = item["b_end"] <= query_start
+                            all_causal = all_causal and causal_ok
+
+                            print(
+                                f"Top-{rank}: "
+                                f"A=[{item['a_start']}, {item['a_end']})  "
+                                f"B=[{item['b_start']}, {item['b_end']})  "
+                                f"Similarity={item['score']:.6f}  "
+                                f"Causal={causal_ok}"
+                            )
+
+                        print("-" * 70)
+                        print("ALL B_end <= C_start :", all_causal)
+
+                        print("\nHCT tensor check:")
+                        print("hist_src shape  :", hist_src.shape)
+                        print("hist_fut shape  :", hist_fut.shape)
+                        print("hist_score shape:", hist_score.shape)
+                        print("valid           :", hist_valid)
+
+                        # ----------------------------------------------------
+                        # Save one retrieval example for visualization.
+                        # D_endo is saved ONLY for offline diagnosis.
+                        # It does not participate in retrieval.
+                        # ----------------------------------------------------
+                        debug_dir = "./hct_debug"
+                        os.makedirs(debug_dir, exist_ok=True)
+
+                        C_endo = hct_debug_series[
+                            query_start : query_start + config.seq_len,
+                            :series_dim,
+                        ].cpu().numpy()
+
+                        D_endo = hct_debug_series[
+                            query_start + config.seq_len :
+                            query_start + config.seq_len + config.pred_len,
+                            :series_dim,
+                        ].cpu().numpy()
+
+                        save_dict = {
+                            "C_endo": C_endo,
+                            "D_endo": D_endo,
+                            "query_start": np.array([query_start]),
+                        }
+
+                        for rank, item in enumerate(retrieved, start=1):
+                            save_dict[f"A{rank}_endo"] = (
+                                item["A_endo"].cpu().numpy()
+                            )
+                            save_dict[f"B{rank}_endo"] = (
+                                item["B_endo"].cpu().numpy()
+                            )
+                            save_dict[f"score{rank}"] = np.array(
+                                [item["score"]]
+                            )
+
+                        np.savez(
+                            "./hct_debug/b1_retrieval_check.npz",
+                            **save_dict,
+                        )
+
+                        print(
+                            "Saved HCT retrieval debug data to: "
+                            "./hct_debug/b1_retrieval_check.npz"
+                        )
+                        print("=" * 70)
+                        print("\n")
+
+                        # Hard failure if any future leakage is detected.
+                        assert all_causal, (
+                            "HCT DATA LEAKAGE: historical B overlaps current C."
+                        )
+
+                        hct_debug_printed = True
+                        break
 
 
 
+                hct_pack = None
 
-                
+                if (
+                    getattr(config, "hct_mode", 0) > 0
+                    and hct_index is not None
+                    and hct_debug_retriever is not None
+                ):
+                    hct_pack = hct_debug_retriever.retrieve_batch(
+                        full_series=hct_debug_series,
+                        query_starts=hct_index,
+                    )
+
+                # ------------------------------------------------------------
+                # Batch retrieval shape check.
+                # Print only once: first batch of first epoch.
+                # ------------------------------------------------------------
+                if (
+                    hct_pack is not None
+                    and epoch == 0
+                    and i == 0
+                ):
+                    print("\nHCT BATCH CHECK")
+                    print("hist_src   :", hct_pack["hist_src"].shape)
+                    print("hist_fut   :", hct_pack["hist_fut"].shape)
+                    print("hist_score :", hct_pack["hist_score"].shape)
+                    print("hist_valid :", hct_pack["hist_valid"].shape)
+                    print(
+                        "valid count:",
+                        int(hct_pack["hist_valid"].sum().item()),
+                        "/",
+                        int(hct_pack["hist_valid"].numel()),
+                    )
+
                 optimizer.zero_grad()
+
                 input, target, input_mark, target_mark = (
                     input.to(device),
                     target.to(device),
                     input_mark.to(device),
                     target_mark.to(device),
                 )
-                if hct_index is not None:
-                    hct_index = hct_index.to(device)
 
+                # IMPORTANT:
+                # Keep hct_index on CPU. It is only an index used by the
+                # CPU-side historical transition retriever.
+                # Do not call hct_index.to(device) here.
 
+                # Known future exogenous variables.
+                exog_future = target[
+                    :, -config.horizon :, series_dim:
+                ].to(device)
 
-                # decoder input
-                exog_future = target[:, -config.horizon :, series_dim:].to(device)
                 if hct_index is None:
                     out_loss = self._process(
                         input,
@@ -618,10 +816,6 @@ class DeepForecastingModelBase(ModelBase):
                         exog_future,
                         hct_index=hct_index,
                     )
-
-
-
-
                 additional_loss = 0
                 output = out_loss["output"]
                 if "additional_loss" in out_loss:
