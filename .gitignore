@@ -4,4 +4,6 @@ result/
 .vscode/
 .git
 *.DS_Store
-venv/
+venv/__pycache__/
+*.pyc
+tmp/
