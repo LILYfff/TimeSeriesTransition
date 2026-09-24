@@ -360,9 +360,27 @@ class DeepForecastingModelBase(ModelBase):
                     target_mark.to(device),
                 )
                 exog_future = target[:, -config.horizon :, series_dim:]
-                out_loss = self._process(
-                    input, target, input_mark, target_mark, exog_future
-                )
+                if hct_index is None:
+                     out_loss = self._process(
+                        input,
+                        target,
+                        input_mark,
+                        target_mark,
+                        exog_future,
+                    )
+                else:
+                     out_loss = self._process(
+                        input,
+                        target,
+                        input_mark,
+                        target_mark,
+                        exog_future,
+                        hct_index=hct_index,
+                     )
+
+
+
+
                 additional_loss = 0
                 output = out_loss["output"]
                 if "additional_loss" in out_loss:
@@ -518,6 +536,7 @@ class DeepForecastingModelBase(ModelBase):
             batch_size=config.batch_size,
             shuffle=True,
             drop_last=train_drop_last,
+            return_index=(getattr(config, "hct_mode", 0) > 0),
         )
         # Define optimizer
         optimizer = self._init_optimizer(CovariateFusion=self.CovariateFusion)
@@ -545,9 +564,29 @@ class DeepForecastingModelBase(ModelBase):
             if self.CovariateFusion is not None:
                 self.CovariateFusion.train()
             # for input, target, input_mark, target_mark in train_data_loader:
-            for i, (input, target, input_mark, target_mark) in enumerate(
-                self.train_data_loader
-            ):
+            for i, batch in enumerate(self.train_data_loader):
+                if len(batch) == 5:
+                    (
+                        input,
+                        target,
+                        input_mark,
+                        target_mark,
+                        hct_index,
+                    ) = batch
+                else:
+                    (
+                        input,
+                        target,
+                        input_mark,
+                        target_mark,
+                    ) = batch
+                    hct_index = None
+                
+
+
+
+
+                
                 optimizer.zero_grad()
                 input, target, input_mark, target_mark = (
                     input.to(device),
@@ -555,11 +594,34 @@ class DeepForecastingModelBase(ModelBase):
                     input_mark.to(device),
                     target_mark.to(device),
                 )
+                if hct_index is not None:
+                    hct_index = hct_index.to(device)
+
+
+
                 # decoder input
                 exog_future = target[:, -config.horizon :, series_dim:].to(device)
-                out_loss = self._process(
-                    input, target, input_mark, target_mark, exog_future
-                )
+                if hct_index is None:
+                    out_loss = self._process(
+                        input,
+                        target,
+                        input_mark,
+                        target_mark,
+                        exog_future,
+                    )
+                else:
+                    out_loss = self._process(
+                        input,
+                        target,
+                        input_mark,
+                        target_mark,
+                        exog_future,
+                        hct_index=hct_index,
+                    )
+
+
+
+
                 additional_loss = 0
                 output = out_loss["output"]
                 if "additional_loss" in out_loss:

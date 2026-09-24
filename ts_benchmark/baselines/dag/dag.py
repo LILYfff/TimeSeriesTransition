@@ -32,11 +32,12 @@ MODEL_HYPER_PARAMS = {
     "use_t": True,
 
     "infer_use_future": True,
+
+    ## HCT
     "hct_mode": 0,
     "hct_topk": 5,
     "hct_memory_stride": 12,
     "hct_bins": 24,
-    "hct_dropout": 0.0,
 
 }
 
@@ -75,9 +76,24 @@ class DAG(DeepForecastingModelBase):
     def _init_model(self):
         return DAGModel(self.config)
 
-    def _process(self, input, target, input_mark, target_mark, exog_future=None):
-        output, causality_loss = self.model(input, exog_future)
+    def _process(
+        self,
+        input,
+        target,
+        input_mark,
+        target_mark,
+        exog_future=None,
+        hct_index=None,
+    ):
+        output, causality_loss = self.model(
+            input,
+            exog_future,
+            hct_index=hct_index,
+        )
+
         out_loss = {"output": output}
+
         if self.model.training:
             out_loss["additional_loss"] = causality_loss
+
         return out_loss

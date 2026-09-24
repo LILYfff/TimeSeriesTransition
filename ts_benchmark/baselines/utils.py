@@ -295,8 +295,15 @@ def get_time_mark(
         raise ValueError("Unknown time encoding {}".format(timeenc))
     return data_stamp.astype(np.float32)
 
-
-def forecasting_data_provider(data, config, timeenc, batch_size, shuffle, drop_last):
+def forecasting_data_provider(
+    data,
+    config,
+    timeenc,
+    batch_size,
+    shuffle,
+    drop_last,
+    return_index=False,
+):
     dataset = DatasetForTransformer(
         dataset=data,
         history_len=config.seq_len,
@@ -304,7 +311,9 @@ def forecasting_data_provider(data, config, timeenc, batch_size, shuffle, drop_l
         label_len=config.label_len,
         timeenc=timeenc,
         freq=config.freq,
+        return_index=return_index,
     )
+
     data_loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -325,6 +334,7 @@ class DatasetForTransformer:
         label_len: int = 5,
         timeenc: int = 1,
         freq: str = "h",
+        return_index: bool = False,
     ):
         # init
 
@@ -335,6 +345,7 @@ class DatasetForTransformer:
         self.current_index = 0
         self.timeenc = timeenc
         self.freq = freq
+        self.return_index = return_index
         self.__read_data__()
 
     def __len__(self) -> int:
@@ -366,6 +377,14 @@ class DatasetForTransformer:
         seq_y = torch.tensor(seq_y.values, dtype=torch.float32)
         seq_x_mark = torch.tensor(seq_x_mark, dtype=torch.float32)
         seq_y_mark = torch.tensor(seq_y_mark, dtype=torch.float32)
+        if self.return_index:
+            return (
+                seq_x,
+                seq_y,
+                seq_x_mark,
+                seq_y_mark,
+                torch.tensor(index, dtype=torch.long),
+            )
         return seq_x, seq_y, seq_x_mark, seq_y_mark
 
 
