@@ -7,3 +7,5 @@ result/
 venv/__pycache__/
 *.pyc
 tmp/
+
+diagnostics/

@@ -593,8 +593,9 @@ class DeepForecastingModelBase(ModelBase):
         - hct_mode=0: original B0/A3 path.
         - hct_mode=1: B1, causal Endo-only retrieval.
         - hct_mode=2: B2, causal Endo + Past-Exo retrieval.
-        - hct_mode=3: B3, causal Partial Joint Transition retrieval using
-          [A_endo,A_exo,B_exo] <-> [C_endo,C_exo,D_exo].
+        - hct_mode=3: B3, causal conditional product-kernel retrieval:
+          B2 context compatibility x source-anchored future-exogenous
+          evolution compatibility (A_exo->B_exo vs C_exo->D_exo).
 
         The neural HCT transition encoder/fusion is identical for B1/B2/B3;
         only the non-parametric retrieval condition changes.
@@ -1080,11 +1081,37 @@ class DeepForecastingModelBase(ModelBase):
                                         ].mean().item()
                                     ),
                                 )
+                            if "hist_score_drive" in hct_pack:
+                                print(
+                                    "Drive score mean    :",
+                                    float(
+                                        hct_pack["hist_score_drive"][
+                                            valid_mask
+                                        ].mean().item()
+                                    ),
+                                )
+                            if "hist_kernel_context" in hct_pack:
+                                print(
+                                    "Context kernel mean :",
+                                    float(
+                                        hct_pack["hist_kernel_context"][
+                                            valid_mask
+                                        ].mean().item()
+                                    ),
+                                )
+                            if "hist_kernel_drive" in hct_pack:
+                                print(
+                                    "Drive kernel mean   :",
+                                    float(
+                                        hct_pack["hist_kernel_drive"][
+                                            valid_mask
+                                        ].mean().item()
+                                    ),
+                                )
                             print(
-                                "B3 retrieval        : ONE cosine on "
-                                "concat([A_endo,A_exo,B_exo]) vs "
-                                "concat([C_endo,C_exo,D_exo]); "
-                                "no score averaging / no lambda"
+                                "B3 retrieval        : K_context(B2) * "
+                                "K_drive(A_exo->B_exo vs C_exo->D_exo); "
+                                "source-anchored normalization; no lambda"
                             )
 
                     hct_shape_printed = True

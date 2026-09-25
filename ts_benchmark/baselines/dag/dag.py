@@ -37,14 +37,15 @@ MODEL_HYPER_PARAMS = {
     # 0=B0(no HCT)
     # 1=B1: Endo-only retrieval
     # 2=B2: Endo + Past Exo retrieval
-    # 3=B3-Joint: Partial Joint Transition retrieval
-    #   historical observable: [A_endo, A_exo, B_exo]
-    #   current observable:    [C_endo, C_exo, D_exo]
-    #   one unified cosine similarity; no score averaging and no lambda.
+    # 3=B3: Conditional Product-Kernel Transition retrieval
+    #   context factor = validated B2 current-state similarity
+    #   drive factor   = source-anchored A_exo->B_exo vs C_exo->D_exo similarity
+    #   final retrieval score = K_context * K_drive; no lambda.
     "hct_mode": 0,
     "hct_topk": 5,
     "hct_memory_stride": 12,
-    # hct_bins is used by the neural HCT TransitionEncoder, not by B3 retrieval.
+    # hct_bins is shared by the neural HCT TransitionEncoder and the B3
+    # source-anchored future-exogenous evolution descriptor.
     "hct_bins": 24,
     "hct_dim": 128,
     "hct_seed": 2026,
