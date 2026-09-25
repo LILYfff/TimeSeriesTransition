@@ -34,10 +34,20 @@ MODEL_HYPER_PARAMS = {
     "infer_use_future": True,
 
     ## HCT
+    # 0=B0(no HCT)
+    # 1=B1: Endo-only retrieval
+    # 2=B2: Endo + Past Exo retrieval
+    # 3=B3-Joint: Partial Joint Transition retrieval
+    #   historical observable: [A_endo, A_exo, B_exo]
+    #   current observable:    [C_endo, C_exo, D_exo]
+    #   one unified cosine similarity; no score averaging and no lambda.
     "hct_mode": 0,
     "hct_topk": 5,
     "hct_memory_stride": 12,
+    # hct_bins is used by the neural HCT TransitionEncoder, not by B3 retrieval.
     "hct_bins": 24,
+    "hct_dim": 128,
+    "hct_seed": 2026,
 
 }
 

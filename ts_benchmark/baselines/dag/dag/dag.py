@@ -34,12 +34,17 @@ MODEL_HYPER_PARAMS = {
     "infer_use_future": True,
 
     ## HCT
+    # 0=B0(no HCT), 1=B1(Endo), 2=B2(Endo+Past Exo), 3=B3(+Future Exo)
     "hct_mode": 0,
     "hct_topk": 5,
     "hct_memory_stride": 12,
     "hct_bins": 24,
     "hct_dim": 128,
     "hct_seed": 2026,
+    # B3 two-stage retrieval: preselect by B2 context, then rerank by
+    # future-exogenous transition similarity.
+    "hct_preselect": 20,
+    "hct_future_lambda": 0.25,
 
 }
 

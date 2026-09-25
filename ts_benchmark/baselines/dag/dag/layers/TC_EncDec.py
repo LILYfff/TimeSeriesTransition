@@ -81,7 +81,7 @@ class TemporalCausalityEncoder(nn.Module):
 
         # HCT is attached by DAGModel only AFTER both original DAG branches
         # have been initialized. This keeps the original temporal/channel
-        # backbone initialization identical between hct_mode=0 and hct_mode=1.
+        # backbone initialization identical between hct_mode=0 and HCT-enabled modes.
         self.hct_fusion = None
 
     def set_hct_fusion(self, hct_fusion):

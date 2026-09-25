@@ -370,6 +370,7 @@ class DeepForecastingModelBase(ModelBase):
         device,
         offset=0,
         max_b_end=None,
+        future_exog=None,
     ):
         """
         Build HCT pack from dataset window indices.
@@ -404,6 +405,7 @@ class DeepForecastingModelBase(ModelBase):
         hct_pack = self.hct_retriever.retrieve_batch(
             full_series=self.hct_full_series,
             query_starts=query_starts,
+            future_exog=future_exog,
             max_b_end=max_b_end,
         )
 
@@ -416,6 +418,7 @@ class DeepForecastingModelBase(ModelBase):
         self,
         query_contexts,
         device,
+        future_exog=None,
     ):
         """
         Build HCT pack for forecast contexts supplied directly.
@@ -435,6 +438,7 @@ class DeepForecastingModelBase(ModelBase):
                 full_series=self.hct_full_series,
                 query_contexts=query_contexts,
                 max_b_end=self.hct_forecast_cutoff,
+                future_exog=future_exog,
             )
         )
 
@@ -482,11 +486,20 @@ class DeepForecastingModelBase(ModelBase):
                     ) = batch
                     hct_index = None
 
+                hct_future_exog = None
+                if int(getattr(config, "hct_mode", 0)) == 3:
+                    # B3 retrieval may use ONLY known future exogenous D_exo.
+                    # Never pass future endogenous target D_endo.
+                    hct_future_exog = target[
+                        :, -config.horizon :, series_dim:
+                    ].detach().cpu()
+
                 hct_pack = self._make_hct_index_pack(
                     hct_index=hct_index,
                     device=device,
                     offset=self.hct_valid_offset,
                     max_b_end=self.hct_train_cutoff,
+                    future_exog=hct_future_exog,
                 )
 
                 input, target, input_mark, target_mark = (
@@ -578,7 +591,13 @@ class DeepForecastingModelBase(ModelBase):
 
         HCT behavior:
         - hct_mode=0: original B0/A3 path.
-        - hct_mode=1: causal Endo-only historical-transition retrieval.
+        - hct_mode=1: B1, causal Endo-only retrieval.
+        - hct_mode=2: B2, causal Endo + Past-Exo retrieval.
+        - hct_mode=3: B3, causal Partial Joint Transition retrieval using
+          [A_endo,A_exo,B_exo] <-> [C_endo,C_exo,D_exo].
+
+        The neural HCT transition encoder/fusion is identical for B1/B2/B3;
+        only the non-parametric retrieval condition changes.
         """
         if covariates is None:
             covariates = {}
@@ -609,6 +628,17 @@ class DeepForecastingModelBase(ModelBase):
         self.config.series_dim = series_dim
         self.config.input_dim = series_dim + exog_dim
         self.config.output_dim = series_dim
+
+        if int(getattr(self.config, "hct_mode", 0)) == 3:
+            if exog_dim <= 0:
+                raise ValueError(
+                    "B3 / hct_mode=3 requires exogenous variables."
+                )
+            if not bool(getattr(self.config, "infer_use_future", False)):
+                raise ValueError(
+                    "B3 / hct_mode=3 requires infer_use_future=1 because "
+                    "known future exogenous variables D_exo condition retrieval."
+                )
 
         criterion = self._init_criterion()
         self.model = self._init_model()
@@ -805,6 +835,11 @@ class DeepForecastingModelBase(ModelBase):
                     "hct_mode",
                     1,
                 ),
+                bins=getattr(
+                    config,
+                    "hct_bins",
+                    24,
+                ),
             )
             self.hct_retriever.prepare_memory(
                 self.hct_full_series
@@ -928,10 +963,18 @@ class DeepForecastingModelBase(ModelBase):
                     ) = batch
                     hct_index = None
 
+                hct_future_exog = None
+                if int(getattr(config, "hct_mode", 0)) == 3:
+                    # B3 uses ONLY the known future exogenous block D_exo.
+                    hct_future_exog = target[
+                        :, -config.horizon :, series_dim:
+                    ].detach().cpu()
+
                 hct_pack = self._make_hct_index_pack(
                     hct_index=hct_index,
                     device=device,
                     offset=0,
+                    future_exog=hct_future_exog,
                 )
 
                 # One concise development check.
@@ -970,6 +1013,80 @@ class DeepForecastingModelBase(ModelBase):
                             ].numel()
                         ),
                     )
+                    print(
+                        "hct_mode    :",
+                        int(getattr(config, "hct_mode", 0)),
+                    )
+
+                    valid_mask = hct_pack["hist_valid"]
+                    if bool(valid_mask.any().item()):
+                        print(
+                            "Endo score mean     :",
+                            float(
+                                hct_pack["hist_score_endo"][
+                                    valid_mask
+                                ].mean().item()
+                            ),
+                        )
+
+                        if "hist_score_past_exo" in hct_pack:
+                            print(
+                                "Past Exo score mean :",
+                                float(
+                                    hct_pack[
+                                        "hist_score_past_exo"
+                                    ][valid_mask].mean().item()
+                                ),
+                            )
+
+                        if "hist_score_future_exo" in hct_pack:
+                            print(
+                                "Future Exo diagnostic mean:",
+                                float(
+                                    hct_pack[
+                                        "hist_score_future_exo"
+                                    ][valid_mask].mean().item()
+                                ),
+                            )
+
+                        if int(getattr(config, "hct_mode", 0)) == 2:
+                            print(
+                                "Combined score mean :",
+                                float(
+                                    hct_pack["hist_score"][
+                                        valid_mask
+                                    ].mean().item()
+                                ),
+                            )
+                            print(
+                                "B2 retrieval        : "
+                                "0.5 * Endo + 0.5 * Past Exo"
+                            )
+                        elif int(getattr(config, "hct_mode", 0)) == 3:
+                            print(
+                                "Joint score mean    :",
+                                float(
+                                    hct_pack["hist_score"][
+                                        valid_mask
+                                    ].mean().item()
+                                ),
+                            )
+                            if "hist_score_context" in hct_pack:
+                                print(
+                                    "B2 context diagnostic mean:",
+                                    float(
+                                        hct_pack["hist_score_context"][
+                                            valid_mask
+                                        ].mean().item()
+                                    ),
+                                )
+                            print(
+                                "B3 retrieval        : ONE cosine on "
+                                "concat([A_endo,A_exo,B_exo]) vs "
+                                "concat([C_endo,C_exo,D_exo]); "
+                                "no score averaging / no lambda"
+                            )
+
                     hct_shape_printed = True
 
                 optimizer.zero_grad()
@@ -1277,10 +1394,16 @@ class DeepForecastingModelBase(ModelBase):
 
                     hct_pack = (
                         self._make_hct_context_pack(
-                            query_contexts=input[
-                                :, :, :series_dim
-                            ],
+                            # Pass the FULL current history.
+                            # B1 uses Endo; B2 adds Past Exo; B3 also uses
+                            # the legal known future exogenous D_exo below.
+                            query_contexts=input,
                             device=device,
+                            future_exog=(
+                                exog_future
+                                if int(getattr(config, "hct_mode", 0)) == 3
+                                else None
+                            ),
                         )
                     )
 
@@ -1691,14 +1814,32 @@ class DeepForecastingModelBase(ModelBase):
                     for a in answers
                 ) < horizon
             ):
+                # Resolve this rolling step's legal known future exogenous
+                # block BEFORE B3 retrieval. No future endogenous target is used.
+                if exog_future is not None:
+                    exog_future1 = exog_future[
+                        :,
+                        rolling_time
+                        * self.config.horizon :
+                        (rolling_time + 1)
+                        * self.config.horizon,
+                        :,
+                    ]
+                else:
+                    exog_future1 = None
+
                 # HCT retrieval is intentionally done on CPU from input_np.
                 hct_pack = (
                     self._make_hct_context_pack(
-                        query_contexts=input_np[
-                            ...,
-                            :series_dim,
-                        ],
+                        # Pass the FULL current history.
+                        # B1 uses Endo; B2 adds Past Exo; B3 also uses D_exo.
+                        query_contexts=input_np,
                         device=device,
+                        future_exog=(
+                            exog_future1
+                            if int(getattr(self.config, "hct_mode", 0)) == 3
+                            else None
+                        ),
                     )
                 )
 
@@ -1725,18 +1866,6 @@ class DeepForecastingModelBase(ModelBase):
                         dtype=torch.float32,
                     ).to(device),
                 )
-
-                if exog_future is not None:
-                    exog_future1 = exog_future[
-                        :,
-                        rolling_time
-                        * self.config.horizon :
-                        (rolling_time + 1)
-                        * self.config.horizon,
-                        :,
-                    ]
-                else:
-                    exog_future1 = None
 
                 if hct_pack is None:
                     out_loss = self._process(

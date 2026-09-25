@@ -34,7 +34,7 @@ class DAGModel(nn.Module):
         )
 
         # ------------------------------------------------------------
-        # IMPORTANT FOR FAIR B0/B1 COMPARISON
+        # IMPORTANT FOR FAIR B0/B1/B2 COMPARISON
         # ------------------------------------------------------------
         # Initialize the ORIGINAL DAG branches first, in exactly the same
         # order as hct_mode=0. HCT is attached only afterward.
