@@ -88,6 +88,14 @@ class DeepForecastingModelBase(ModelBase):
         self.seq_len = self.config.seq_len
         self.win_size = self.config.seq_len
 
+        # HCT runtime state. These remain None when hct_mode == 0,
+        # so non-HCT models and B0 keep the original path.
+        self.hct_retriever = None
+        self.hct_full_series = None
+        self.hct_valid_offset = 0
+        self.hct_train_cutoff = None
+        self.hct_forecast_cutoff = None
+
     def _init_model(self):
         """
         Initialize the model.
@@ -336,250 +344,127 @@ class DeepForecastingModelBase(ModelBase):
         padding_mark = get_time_mark(whole_time_stamp, 1, self.config.freq)
         return padding_mark
 
+    def _hct_enabled(self):
+        return (
+            getattr(self.config, "hct_mode", 0) > 0
+            and self.hct_retriever is not None
+            and self.hct_full_series is not None
+        )
+
+    @staticmethod
+    def _move_hct_pack_to_device(hct_pack, device):
+        if hct_pack is None:
+            return None
+
+        moved = {}
+        for key, value in hct_pack.items():
+            if torch.is_tensor(value):
+                moved[key] = value.to(device)
+            else:
+                moved[key] = value
+        return moved
+
+    def _make_hct_index_pack(
+        self,
+        hct_index,
+        device,
+        offset=0,
+        max_b_end=None,
+    ):
+        """
+        Build HCT pack from dataset window indices.
+
+        Training:
+            offset = 0
+
+        Validation:
+            valid_data begins at train_border - seq_len, therefore
+            offset = self.hct_valid_offset
+        """
+        if (
+            not self._hct_enabled()
+            or hct_index is None
+        ):
+            return None
+
+        if torch.is_tensor(hct_index):
+            query_starts = (
+                hct_index.detach().cpu().long()
+                + int(offset)
+            )
+        else:
+            query_starts = (
+                torch.as_tensor(
+                    hct_index,
+                    dtype=torch.long,
+                )
+                + int(offset)
+            )
+
+        hct_pack = self.hct_retriever.retrieve_batch(
+            full_series=self.hct_full_series,
+            query_starts=query_starts,
+            max_b_end=max_b_end,
+        )
+
+        return self._move_hct_pack_to_device(
+            hct_pack,
+            device,
+        )
+
+    def _make_hct_context_pack(
+        self,
+        query_contexts,
+        device,
+    ):
+        """
+        Build HCT pack for forecast contexts supplied directly.
+
+        The memory bank is frozen from the train-validation period.
+        hct_forecast_cutoff is the start of the earliest forecast context,
+        so every historical B satisfies B_end <= C_start.
+        """
+        if not self._hct_enabled():
+            return None
+
+        if self.hct_forecast_cutoff is None:
+            return None
+
+        hct_pack = (
+            self.hct_retriever.retrieve_context_batch(
+                full_series=self.hct_full_series,
+                query_contexts=query_contexts,
+                max_b_end=self.hct_forecast_cutoff,
+            )
+        )
+
+        return self._move_hct_pack_to_device(
+            hct_pack,
+            device,
+        )
+
     def validate(
-        self, valid_data_loader: DataLoader, series_dim: int, criterion: torch.nn.Module
+        self,
+        valid_data_loader: DataLoader,
+        series_dim: int,
+        criterion: torch.nn.Module,
     ) -> float:
         """
-        Validates the model performance on the provided validation dataset.
-        :param valid_data_loader: A PyTorch DataLoader for the validation dataset.
-        :param series_dim : The number of series data‘s dimensions.
-        :param criterion : The loss function to compute the loss between model predictions and ground truth.
-        :returns:The mean loss computed over the validation dataset.
+        Validate with the same HCT path used during training when HCT is enabled.
         """
         config = self.config
         total_loss = []
+
         self.model.eval()
         if self.CovariateFusion is not None:
             self.CovariateFusion.eval()
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+
         with torch.no_grad():
-            for input, target, input_mark, target_mark in valid_data_loader:
-                input, target, input_mark, target_mark = (
-                    input.to(device),
-                    target.to(device),
-                    input_mark.to(device),
-                    target_mark.to(device),
-                )
-                exog_future = target[:, -config.horizon :, series_dim:]
-
-                out_loss = self._process(
-                    input,
-                    target,
-                    input_mark,
-                    target_mark,
-                    exog_future,
-                )
-                additional_loss = 0
-                output = out_loss["output"]
-                if "additional_loss" in out_loss:
-                    additional_loss = out_loss["additional_loss"]
-                target = target[:, -config.horizon :, :series_dim]
-                output = output[:, -config.horizon :, :series_dim]
-                if (
-                    config.fusion_method == "mlp"
-                    or config.fusion_method == "cross_attention"
-                    or config.fusion_method == "conv"
-                ) and self.CovariateFusion is not None:
-                    output = self.CovariateFusion(exog_future, output)
-                output, target = self._post_process(output, target)
-                all_loss = criterion(output, target) + additional_loss
-                loss = all_loss.detach().cpu().numpy()
-                total_loss.append(loss)
-
-        total_loss = np.mean(total_loss)
-        self.model.train()
-        if self.CovariateFusion is not None:
-            self.CovariateFusion.train()
-        return total_loss
-
-    def forecast_fit(
-        self,
-        train_valid_data: pd.DataFrame,
-        *,
-        covariates: Optional[dict] = None,
-        train_ratio_in_tv: float = 1.0,
-        **kwargs,
-    ) -> "ModelBase":
-        """
-        Train the model.
-        :param train_valid_data: Time series data used for training and validation.
-        :param covariates: Additional external variables.
-        :param train_ratio_in_tv: Represents the splitting ratio of the training set validation set. If it is equal to 1, it means that the validation set is not partitioned.
-        :return: The fitted model object.
-        """
-        if covariates is None:
-            covariates = {}
-        series_dim = train_valid_data.shape[-1]
-        exog_data = covariates.get("exog", None)
-        if exog_data is not None:
-            train_valid_data = pd.concat([train_valid_data, exog_data], axis=1)
-            exog_dim = exog_data.shape[-1]
-        else:
-            exog_dim = 0
-
-        if train_valid_data.shape[1] == 1:
-            train_drop_last = False
-            self.single_forecasting_hyper_param_tune(train_valid_data)
-        else:
-            train_drop_last = True
-            self.multi_forecasting_hyper_param_tune(train_valid_data)
-
-        self.config.series_dim = series_dim
-        self.config.input_dim = series_dim + exog_dim
-        self.config.output_dim = series_dim
-
-        criterion = self._init_criterion()
-        self.model = self._init_model()
-        if self.config.fusion_method == "mlp":
-            self.CovariateFusion = MLP(self.config)
-        elif self.config.fusion_method == "cross_attention":
-            self.CovariateFusion = CrossAttention(self.config)
-        elif self.config.fusion_method == "conv":
-            self.CovariateFusion = Conv(self.config)
-        else:
-            self.CovariateFusion = None
-        device_ids = np.arange(torch.cuda.device_count()).tolist()
-        if len(device_ids) > 1 and self.config.parallel_strategy == "DP":
-            self.model = nn.DataParallel(self.model, device_ids=device_ids)
-            if self.CovariateFusion is not None:
-                self.CovariateFusion = nn.DataParallel(
-                    self.CovariateFusion, device_ids=device_ids
-                )
-        print(
-            "----------------------------------------------------------",
-            self.model_name,
-        )
-        config = self.config
-        train_data, valid_data = train_val_split(
-            train_valid_data, train_ratio_in_tv, config.seq_len
-        )
-
-        # 分别 fit 两个 scaler
-        if exog_dim > 0:
-            # Fit scaler1 for series data
-            self.scaler1.fit(train_data.values[:, :series_dim])
-            # Fit scaler2 for exog data
-            self.scaler2.fit(train_data.values[:, series_dim:])
-
-            # self.scaler.fit(train_data.values)
-
-            if config.norm:
-                scaled_series = self.scaler1.transform(
-                    train_data.values[:, :series_dim]
-                )
-                scaled_exog = self.scaler2.transform(train_data.values[:, series_dim:])
-                final_train_data = np.concatenate((scaled_series, scaled_exog), axis=1)
-                train_data = pd.DataFrame(
-                    # self.scaler.transform(train_data.values),
-                    final_train_data,
-                    columns=train_data.columns,
-                    index=train_data.index,
-                )
-        else:
-            # Only series data, use scaler1
-            self.scaler1.fit(train_data.values)
-            if config.norm:
-                train_data = pd.DataFrame(
-                    self.scaler1.transform(train_data.values),
-                    columns=train_data.columns,
-                    index=train_data.index,
-                )
-
-        if train_ratio_in_tv != 1:
-            if config.norm:
-                if exog_dim > 0:
-                    scaled_series = self.scaler1.transform(
-                        valid_data.values[:, :series_dim]
-                    )
-                    scaled_exog = self.scaler2.transform(
-                        valid_data.values[:, series_dim:]
-                    )
-                    final_valid_data = np.concatenate(
-                        (scaled_series, scaled_exog), axis=1
-                    )
-                    valid_data = pd.DataFrame(
-                        final_valid_data,
-                        columns=valid_data.columns,
-                        index=valid_data.index,
-                    )
-                else:
-                    valid_data = pd.DataFrame(
-                        self.scaler1.transform(valid_data.values),
-                        columns=valid_data.columns,
-                        index=valid_data.index,
-                    )
-            valid_dataset, valid_data_loader = forecasting_data_provider(
-                valid_data,
-                config,
-                timeenc=1,
-                batch_size=config.batch_size,
-                shuffle=True,
-                drop_last=False,
-            )
-
-        train_dataset, self.train_data_loader = forecasting_data_provider(
-            train_data,
-            config,
-            timeenc=1,
-            batch_size=config.batch_size,
-            shuffle=True,
-            drop_last=train_drop_last,
-            return_index=(getattr(config, "hct_mode", 0) > 0),
-        )
-        # ============================================================
-        # HCT retrieval debug
-        # Only used to verify historical transition retrieval.
-        # No HCT information is injected into the model at this stage.
-        # ============================================================
-        hct_debug_retriever = None
-        hct_debug_series = None
-
-        if getattr(config, "hct_mode", 0) > 0:
-            from ts_benchmark.baselines.dag.hct_retrieval import HCTRetriever
-
-            hct_debug_retriever = HCTRetriever(
-                seq_len=config.seq_len,
-                pred_len=config.pred_len,
-                series_dim=series_dim,
-                topk=getattr(config, "hct_topk", 5),
-                stride=getattr(config, "hct_memory_stride", 12),
-            )
-
-            # train_data has already been normalized here.
-            # Shape: [N, endogenous + exogenous]
-            hct_debug_series = torch.tensor(
-                train_data.values,
-                dtype=torch.float32,
-            )
-
-
-        # Define optimizer
-        optimizer = self._init_optimizer(CovariateFusion=self.CovariateFusion)
-
-        if config.use_amp == 1:
-            scaler = torch.cuda.amp.GradScaler()
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        self.early_stopping = self._init_early_stopping()
-        self.model.to(device)
-        if self.CovariateFusion is not None:
-            self.CovariateFusion.to(device)
-        total_params = sum(
-            p.numel() for p in self.model.parameters() if p.requires_grad
-        )
-        if self.CovariateFusion is not None:
-            total_params += sum(
-                p.numel() for p in self.CovariateFusion.parameters() if p.requires_grad
-            )
-        print(f"Total trainable parameters: {total_params}")
-        hct_debug_printed = False
-        for epoch in range(config.num_epochs):
-            self.model.train()
-            if self.CovariateFusion is not None:
-                self.CovariateFusion.train()
-            # for input, target, input_mark, target_mark in train_data_loader:
-            for i, batch in enumerate(self.train_data_loader):
+            for batch in valid_data_loader:
                 if len(batch) == 5:
                     (
                         input,
@@ -596,191 +481,13 @@ class DeepForecastingModelBase(ModelBase):
                         target_mark,
                     ) = batch
                     hct_index = None
-            
-                # ============================================================
-                # HCT B1 retrieval verification
-                # ============================================================
-                if (
-                    getattr(config, "hct_mode", 0) == 1
-                    and hct_index is not None
-                    and hct_debug_retriever is not None
-                    and not hct_debug_printed
-                ):
-                    # The DataLoader is shuffled, so the first item in a batch
-                    # may be too early to have a complete historical A -> B.
-                    # Find the first eligible query in this batch.
-                    for q_tensor in hct_index:
-                        query_start = int(q_tensor.item())
 
-                        # At least one complete historical transition must exist:
-                        # A: [j, j + L)
-                        # B: [j + L, j + L + H)
-                        # and B_end <= C_start.
-                        if query_start < config.seq_len + config.pred_len:
-                            continue
-
-                        # ----------------------------------------------------
-                        # 1) Retrieve the actual Top-K transition records.
-                        #    This object is needed for printing time ranges,
-                        #    causal checks, and visualization.
-                        # ----------------------------------------------------
-                        retrieved = hct_debug_retriever.retrieve(
-                            full_series=hct_debug_series,
-                            query_start=query_start,
-                        )
-
-                        if retrieved is None or len(retrieved) == 0:
-                            continue
-
-                        # ----------------------------------------------------
-                        # 2) Convert the same Top-K retrieval result to tensors.
-                        #    Expected for ETTh1, H=96, K=5:
-                        #      hist_src   [5, 96, 1]
-                        #      hist_fut   [5, 96, 1]
-                        #      hist_score [5]
-                        # ----------------------------------------------------
-                        (
-                            hist_src,
-                            hist_fut,
-                            hist_score,
-                            hist_valid,
-                        ) = hct_debug_retriever.retrieve_tensors(
-                            full_series=hct_debug_series,
-                            query_start=query_start,
-                        )
-
-                        print("\n")
-                        print("=" * 70)
-                        print("HCT B1 RETRIEVAL CHECK")
-                        print("=" * 70)
-                        print(f"hct_mode      : {config.hct_mode}")
-                        print(f"seq_len (L)   : {config.seq_len}")
-                        print(f"pred_len (H)  : {config.pred_len}")
-                        print(f"top-k         : {len(retrieved)}")
-                        print(f"memory stride : {config.hct_memory_stride}")
-                        print()
-                        print(f"Query C start : {query_start}")
-                        print(
-                            f"Query C range : "
-                            f"[{query_start}, {query_start + config.seq_len})"
-                        )
-                        print("-" * 70)
-
-                        all_causal = True
-
-                        for rank, item in enumerate(retrieved, start=1):
-                            causal_ok = item["b_end"] <= query_start
-                            all_causal = all_causal and causal_ok
-
-                            print(
-                                f"Top-{rank}: "
-                                f"A=[{item['a_start']}, {item['a_end']})  "
-                                f"B=[{item['b_start']}, {item['b_end']})  "
-                                f"Similarity={item['score']:.6f}  "
-                                f"Causal={causal_ok}"
-                            )
-
-                        print("-" * 70)
-                        print("ALL B_end <= C_start :", all_causal)
-
-                        print("\nHCT tensor check:")
-                        print("hist_src shape  :", hist_src.shape)
-                        print("hist_fut shape  :", hist_fut.shape)
-                        print("hist_score shape:", hist_score.shape)
-                        print("valid           :", hist_valid)
-
-                        # ----------------------------------------------------
-                        # Save one retrieval example for visualization.
-                        # D_endo is saved ONLY for offline diagnosis.
-                        # It does not participate in retrieval.
-                        # ----------------------------------------------------
-                        debug_dir = "./hct_debug"
-                        os.makedirs(debug_dir, exist_ok=True)
-
-                        C_endo = hct_debug_series[
-                            query_start : query_start + config.seq_len,
-                            :series_dim,
-                        ].cpu().numpy()
-
-                        D_endo = hct_debug_series[
-                            query_start + config.seq_len :
-                            query_start + config.seq_len + config.pred_len,
-                            :series_dim,
-                        ].cpu().numpy()
-
-                        save_dict = {
-                            "C_endo": C_endo,
-                            "D_endo": D_endo,
-                            "query_start": np.array([query_start]),
-                        }
-
-                        for rank, item in enumerate(retrieved, start=1):
-                            save_dict[f"A{rank}_endo"] = (
-                                item["A_endo"].cpu().numpy()
-                            )
-                            save_dict[f"B{rank}_endo"] = (
-                                item["B_endo"].cpu().numpy()
-                            )
-                            save_dict[f"score{rank}"] = np.array(
-                                [item["score"]]
-                            )
-
-                        np.savez(
-                            "./hct_debug/b1_retrieval_check.npz",
-                            **save_dict,
-                        )
-
-                        print(
-                            "Saved HCT retrieval debug data to: "
-                            "./hct_debug/b1_retrieval_check.npz"
-                        )
-                        print("=" * 70)
-                        print("\n")
-
-                        # Hard failure if any future leakage is detected.
-                        assert all_causal, (
-                            "HCT DATA LEAKAGE: historical B overlaps current C."
-                        )
-
-                        hct_debug_printed = True
-                        break
-
-
-
-                hct_pack = None
-
-                if (
-                    getattr(config, "hct_mode", 0) > 0
-                    and hct_index is not None
-                    and hct_debug_retriever is not None
-                ):
-                    hct_pack = hct_debug_retriever.retrieve_batch(
-                        full_series=hct_debug_series,
-                        query_starts=hct_index,
-                    )
-
-                # ------------------------------------------------------------
-                # Batch retrieval shape check.
-                # Print only once: first batch of first epoch.
-                # ------------------------------------------------------------
-                if (
-                    hct_pack is not None
-                    and epoch == 0
-                    and i == 0
-                ):
-                    print("\nHCT BATCH CHECK")
-                    print("hist_src   :", hct_pack["hist_src"].shape)
-                    print("hist_fut   :", hct_pack["hist_fut"].shape)
-                    print("hist_score :", hct_pack["hist_score"].shape)
-                    print("hist_valid :", hct_pack["hist_valid"].shape)
-                    print(
-                        "valid count:",
-                        int(hct_pack["hist_valid"].sum().item()),
-                        "/",
-                        int(hct_pack["hist_valid"].numel()),
-                    )
-
-                optimizer.zero_grad()
+                hct_pack = self._make_hct_index_pack(
+                    hct_index=hct_index,
+                    device=device,
+                    offset=self.hct_valid_offset,
+                    max_b_end=self.hct_train_cutoff,
+                )
 
                 input, target, input_mark, target_mark = (
                     input.to(device),
@@ -789,17 +496,11 @@ class DeepForecastingModelBase(ModelBase):
                     target_mark.to(device),
                 )
 
-                # IMPORTANT:
-                # Keep hct_index on CPU. It is only an index used by the
-                # CPU-side historical transition retriever.
-                # Do not call hct_index.to(device) here.
-
-                # Known future exogenous variables.
                 exog_future = target[
                     :, -config.horizon :, series_dim:
-                ].to(device)
+                ]
 
-                if hct_index is None:
+                if hct_pack is None:
                     out_loss = self._process(
                         input,
                         target,
@@ -814,30 +515,542 @@ class DeepForecastingModelBase(ModelBase):
                         input_mark,
                         target_mark,
                         exog_future,
-                        hct_index=hct_index,
+                        hct_pack=hct_pack,
                     )
+
                 additional_loss = 0
                 output = out_loss["output"]
+
                 if "additional_loss" in out_loss:
                     additional_loss = out_loss["additional_loss"]
 
-                target = target[:, -config.horizon :, :series_dim]
-                output = output[:, -config.horizon :, :series_dim]
+                target = target[
+                    :, -config.horizon :, :series_dim
+                ]
+                output = output[
+                    :, -config.horizon :, :series_dim
+                ]
+
+                if (
+                    config.fusion_method == "mlp"
+                    or config.fusion_method == "cross_attention"
+                    or config.fusion_method == "conv"
+                ) and self.CovariateFusion is not None:
+                    output = self.CovariateFusion(
+                        exog_future,
+                        output,
+                    )
+
+                output, target = self._post_process(
+                    output,
+                    target,
+                )
+
+                all_loss = (
+                    criterion(output, target)
+                    + additional_loss
+                )
+                loss = (
+                    all_loss.detach()
+                    .cpu()
+                    .numpy()
+                )
+                total_loss.append(loss)
+
+        total_loss = np.mean(total_loss)
+
+        self.model.train()
+        if self.CovariateFusion is not None:
+            self.CovariateFusion.train()
+
+        return total_loss
+
+    def forecast_fit(
+        self,
+        train_valid_data: pd.DataFrame,
+        *,
+        covariates: Optional[dict] = None,
+        train_ratio_in_tv: float = 1.0,
+        **kwargs,
+    ) -> "ModelBase":
+        """
+        Train the model.
+
+        HCT behavior:
+        - hct_mode=0: original B0/A3 path.
+        - hct_mode=1: causal Endo-only historical-transition retrieval.
+        """
+        if covariates is None:
+            covariates = {}
+
+        series_dim = train_valid_data.shape[-1]
+        exog_data = covariates.get("exog", None)
+
+        if exog_data is not None:
+            train_valid_data = pd.concat(
+                [train_valid_data, exog_data],
+                axis=1,
+            )
+            exog_dim = exog_data.shape[-1]
+        else:
+            exog_dim = 0
+
+        if train_valid_data.shape[1] == 1:
+            train_drop_last = False
+            self.single_forecasting_hyper_param_tune(
+                train_valid_data
+            )
+        else:
+            train_drop_last = True
+            self.multi_forecasting_hyper_param_tune(
+                train_valid_data
+            )
+
+        self.config.series_dim = series_dim
+        self.config.input_dim = series_dim + exog_dim
+        self.config.output_dim = series_dim
+
+        criterion = self._init_criterion()
+        self.model = self._init_model()
+
+        if self.config.fusion_method == "mlp":
+            self.CovariateFusion = MLP(self.config)
+        elif self.config.fusion_method == "cross_attention":
+            self.CovariateFusion = CrossAttention(
+                self.config
+            )
+        elif self.config.fusion_method == "conv":
+            self.CovariateFusion = Conv(self.config)
+        else:
+            self.CovariateFusion = None
+
+        device_ids = (
+            np.arange(torch.cuda.device_count())
+            .tolist()
+        )
+        if (
+            len(device_ids) > 1
+            and self.config.parallel_strategy == "DP"
+        ):
+            self.model = nn.DataParallel(
+                self.model,
+                device_ids=device_ids,
+            )
+            if self.CovariateFusion is not None:
+                self.CovariateFusion = nn.DataParallel(
+                    self.CovariateFusion,
+                    device_ids=device_ids,
+                )
+
+        print(
+            "----------------------------------------------------------",
+            self.model_name,
+        )
+
+        config = self.config
+
+        # Keep the complete observed train-validation period for HCT memory.
+        # It is transformed with scalers fitted ONLY on train_data below.
+        full_data_for_hct = train_valid_data.copy()
+
+        train_data, valid_data = train_val_split(
+            train_valid_data,
+            train_ratio_in_tv,
+            config.seq_len,
+        )
+
+        # ------------------------------------------------------------
+        # Fit scalers only on the training split.
+        # ------------------------------------------------------------
+        if exog_dim > 0:
+            self.scaler1.fit(
+                train_data.values[:, :series_dim]
+            )
+            self.scaler2.fit(
+                train_data.values[:, series_dim:]
+            )
+
+            if config.norm:
+                scaled_series = self.scaler1.transform(
+                    train_data.values[:, :series_dim]
+                )
+                scaled_exog = self.scaler2.transform(
+                    train_data.values[:, series_dim:]
+                )
+                final_train_data = np.concatenate(
+                    [scaled_series, scaled_exog],
+                    axis=1,
+                )
+                train_data = pd.DataFrame(
+                    final_train_data,
+                    columns=train_data.columns,
+                    index=train_data.index,
+                )
+        else:
+            self.scaler1.fit(train_data.values)
+
+            if config.norm:
+                train_data = pd.DataFrame(
+                    self.scaler1.transform(
+                        train_data.values
+                    ),
+                    columns=train_data.columns,
+                    index=train_data.index,
+                )
+
+        # ------------------------------------------------------------
+        # Validation normalization.
+        # valid_data starts at train_border - seq_len.
+        # ------------------------------------------------------------
+        if train_ratio_in_tv != 1:
+            if config.norm:
+                if exog_dim > 0:
+                    scaled_series = self.scaler1.transform(
+                        valid_data.values[
+                            :, :series_dim
+                        ]
+                    )
+                    scaled_exog = self.scaler2.transform(
+                        valid_data.values[
+                            :, series_dim:
+                        ]
+                    )
+                    final_valid_data = np.concatenate(
+                        [scaled_series, scaled_exog],
+                        axis=1,
+                    )
+                    valid_data = pd.DataFrame(
+                        final_valid_data,
+                        columns=valid_data.columns,
+                        index=valid_data.index,
+                    )
+                else:
+                    valid_data = pd.DataFrame(
+                        self.scaler1.transform(
+                            valid_data.values
+                        ),
+                        columns=valid_data.columns,
+                        index=valid_data.index,
+                    )
+
+        # ------------------------------------------------------------
+        # Build one frozen, normalized HCT memory bank.
+        # ------------------------------------------------------------
+        self.hct_retriever = None
+        self.hct_full_series = None
+        self.hct_valid_offset = 0
+        self.hct_train_cutoff = None
+        self.hct_forecast_cutoff = None
+
+        if getattr(config, "hct_mode", 0) > 0:
+            from ts_benchmark.baselines.dag.hct_retrieval import (
+                HCTRetriever,
+            )
+
+            if config.norm:
+                if exog_dim > 0:
+                    full_scaled_series = (
+                        self.scaler1.transform(
+                            full_data_for_hct.values[
+                                :, :series_dim
+                            ]
+                        )
+                    )
+                    full_scaled_exog = (
+                        self.scaler2.transform(
+                            full_data_for_hct.values[
+                                :, series_dim:
+                            ]
+                        )
+                    )
+                    full_values = np.concatenate(
+                        [
+                            full_scaled_series,
+                            full_scaled_exog,
+                        ],
+                        axis=1,
+                    )
+                else:
+                    full_values = (
+                        self.scaler1.transform(
+                            full_data_for_hct.values
+                        )
+                    )
+            else:
+                full_values = (
+                    full_data_for_hct.values.copy()
+                )
+
+            self.hct_full_series = torch.tensor(
+                full_values,
+                dtype=torch.float32,
+            )
+
+            self.hct_retriever = HCTRetriever(
+                seq_len=config.seq_len,
+                pred_len=config.pred_len,
+                series_dim=series_dim,
+                topk=getattr(
+                    config,
+                    "hct_topk",
+                    5,
+                ),
+                stride=getattr(
+                    config,
+                    "hct_memory_stride",
+                    12,
+                ),
+                mode=getattr(
+                    config,
+                    "hct_mode",
+                    1,
+                ),
+            )
+            self.hct_retriever.prepare_memory(
+                self.hct_full_series
+            )
+
+            # End of the actual training split in full_data_for_hct coordinates.
+            # Validation retrieval is capped here so held-out validation
+            # ground truth can never become memory for later validation windows.
+            self.hct_train_cutoff = len(train_data)
+
+            # train_val_split() makes valid_data begin at:
+            # train_border - seq_len.
+            self.hct_valid_offset = max(
+                len(train_data) - config.seq_len,
+                0,
+            )
+
+            # Earliest rolling forecast context begins seq_len points
+            # before the end of the fitted train-validation period.
+            # Freeze the historical bank before that context.
+            self.hct_forecast_cutoff = max(
+                len(full_data_for_hct)
+                - config.seq_len,
+                0,
+            )
+
+        # ------------------------------------------------------------
+        # Data loaders
+        # ------------------------------------------------------------
+        hct_enabled = (
+            getattr(config, "hct_mode", 0) > 0
+        )
+
+        if train_ratio_in_tv != 1:
+            (
+                valid_dataset,
+                valid_data_loader,
+            ) = forecasting_data_provider(
+                valid_data,
+                config,
+                timeenc=1,
+                batch_size=config.batch_size,
+                shuffle=True,
+                drop_last=False,
+                return_index=hct_enabled,
+            )
+
+        (
+            train_dataset,
+            self.train_data_loader,
+        ) = forecasting_data_provider(
+            train_data,
+            config,
+            timeenc=1,
+            batch_size=config.batch_size,
+            shuffle=True,
+            drop_last=train_drop_last,
+            return_index=hct_enabled,
+        )
+
+        optimizer = self._init_optimizer(
+            CovariateFusion=self.CovariateFusion
+        )
+
+        if config.use_amp == 1:
+            scaler = torch.cuda.amp.GradScaler()
+
+        device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+
+        self.early_stopping = (
+            self._init_early_stopping()
+        )
+
+        self.model.to(device)
+        if self.CovariateFusion is not None:
+            self.CovariateFusion.to(device)
+
+        total_params = sum(
+            p.numel()
+            for p in self.model.parameters()
+            if p.requires_grad
+        )
+        if self.CovariateFusion is not None:
+            total_params += sum(
+                p.numel()
+                for p in self.CovariateFusion.parameters()
+                if p.requires_grad
+            )
+
+        print(
+            f"Total trainable parameters: "
+            f"{total_params}"
+        )
+
+        hct_shape_printed = False
+
+        for epoch in range(config.num_epochs):
+            self.model.train()
+            if self.CovariateFusion is not None:
+                self.CovariateFusion.train()
+
+            for i, batch in enumerate(
+                self.train_data_loader
+            ):
+                if len(batch) == 5:
+                    (
+                        input,
+                        target,
+                        input_mark,
+                        target_mark,
+                        hct_index,
+                    ) = batch
+                else:
+                    (
+                        input,
+                        target,
+                        input_mark,
+                        target_mark,
+                    ) = batch
+                    hct_index = None
+
+                hct_pack = self._make_hct_index_pack(
+                    hct_index=hct_index,
+                    device=device,
+                    offset=0,
+                )
+
+                # One concise development check.
+                if (
+                    hct_pack is not None
+                    and not hct_shape_printed
+                ):
+                    print("\nHCT FORMAL BATCH CHECK")
+                    print(
+                        "hist_src   :",
+                        hct_pack["hist_src"].shape,
+                    )
+                    print(
+                        "hist_fut   :",
+                        hct_pack["hist_fut"].shape,
+                    )
+                    print(
+                        "hist_score :",
+                        hct_pack["hist_score"].shape,
+                    )
+                    print(
+                        "hist_valid :",
+                        hct_pack["hist_valid"].shape,
+                    )
+                    print(
+                        "valid count:",
+                        int(
+                            hct_pack[
+                                "hist_valid"
+                            ].sum().item()
+                        ),
+                        "/",
+                        int(
+                            hct_pack[
+                                "hist_valid"
+                            ].numel()
+                        ),
+                    )
+                    hct_shape_printed = True
+
+                optimizer.zero_grad()
+
+                (
+                    input,
+                    target,
+                    input_mark,
+                    target_mark,
+                ) = (
+                    input.to(device),
+                    target.to(device),
+                    input_mark.to(device),
+                    target_mark.to(device),
+                )
+
+                exog_future = target[
+                    :, -config.horizon :, series_dim:
+                ].to(device)
+
+                if hct_pack is None:
+                    out_loss = self._process(
+                        input,
+                        target,
+                        input_mark,
+                        target_mark,
+                        exog_future,
+                    )
+                else:
+                    out_loss = self._process(
+                        input,
+                        target,
+                        input_mark,
+                        target_mark,
+                        exog_future,
+                        hct_pack=hct_pack,
+                    )
+
+                additional_loss = 0
+                output = out_loss["output"]
+
+                if "additional_loss" in out_loss:
+                    additional_loss = (
+                        out_loss["additional_loss"]
+                    )
+
+                target = target[
+                    :, -config.horizon :, :series_dim
+                ]
+                output = output[
+                    :, -config.horizon :, :series_dim
+                ]
+
                 if (
                     self.config.fusion_method == "mlp"
                     or self.config.fusion_method == "conv"
-                    or self.config.fusion_method == "cross_attention"
+                    or self.config.fusion_method
+                    == "cross_attention"
                 ) and self.CovariateFusion is not None:
-                    output = self.CovariateFusion(exog_future, output)
-                output, target = self._post_process(output, target)
+                    output = self.CovariateFusion(
+                        exog_future,
+                        output,
+                    )
 
-                loss = criterion(output, target)
-                # print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
+                output, target = self._post_process(
+                    output,
+                    target,
+                )
 
-                total_loss = loss + additional_loss
+                loss = criterion(
+                    output,
+                    target,
+                )
+                total_loss = (
+                    loss + additional_loss
+                )
 
                 if config.use_amp == 1:
-                    scaler.scale(total_loss).backward()
+                    scaler.scale(
+                        total_loss
+                    ).backward()
                     scaler.step(optimizer)
                     scaler.update()
                 else:
@@ -845,156 +1058,329 @@ class DeepForecastingModelBase(ModelBase):
                     optimizer.step()
 
                 if self.config.lradj == "TST":
-                    self._adjust_lr(optimizer, epoch + 1, config)
+                    self._adjust_lr(
+                        optimizer,
+                        epoch + 1,
+                        config,
+                    )
 
             if train_ratio_in_tv != 1:
-                valid_loss = self.validate(valid_data_loader, series_dim, criterion)
-                improved = self.early_stopping(valid_loss, self.model)
+                valid_loss = self.validate(
+                    valid_data_loader,
+                    series_dim,
+                    criterion,
+                )
+                improved = self.early_stopping(
+                    valid_loss,
+                    self.model,
+                )
+
                 if improved:
                     if self.CovariateFusion is not None:
-                        self.check_point = self.save_checkpoint(
-                            {
-                                "Model": self.model,
-                                "CovariateFusion": self.CovariateFusion,
-                            }
+                        self.check_point = (
+                            self.save_checkpoint(
+                                {
+                                    "Model": self.model,
+                                    "CovariateFusion":
+                                        self.CovariateFusion,
+                                }
+                            )
                         )
                     else:
-                        self.check_point = self.save_checkpoint({"Model": self.model})
+                        self.check_point = (
+                            self.save_checkpoint(
+                                {
+                                    "Model":
+                                        self.model
+                                }
+                            )
+                        )
+
                 if self.early_stopping.early_stop:
                     break
 
             if self.config.lradj != "TST":
-                self._adjust_lr(optimizer, epoch + 1, config)
+                self._adjust_lr(
+                    optimizer,
+                    epoch + 1,
+                    config,
+                )
+
+        return self
 
     def forecast(
-            self,
-            horizon: int,
-            series: pd.DataFrame,
-            *,
-            covariates: Optional[dict] = None,
+        self,
+        horizon: int,
+        series: pd.DataFrame,
+        *,
+        covariates: Optional[dict] = None,
     ) -> np.ndarray:
         """
         Make predictions.
-        :param horizon: The predicted length.
-        :param series: Time series data used for prediction.
-        :param covariates: Additional external variables
-        :return: An array of predicted results.
+
+        When HCT is enabled, current C is taken directly from the normalized
+        forecast input. Historical candidates remain frozen in the fitted
+        train-validation memory and are restricted by hct_forecast_cutoff.
         """
         if covariates is None:
             covariates = {}
+
         series_dim = series.shape[-1]
         exog_data = covariates.get("exog", None)
+
         if exog_data is not None:
             if (
-                    hasattr(self.config, "output_chunk_length")
-                    and horizon != self.config.output_chunk_length
+                hasattr(
+                    self.config,
+                    "output_chunk_length",
+                )
+                and horizon
+                != self.config.output_chunk_length
             ):
                 raise ValueError(
-                    f"Error: 'exog' is enabled during training, but horizon ({horizon}) != output_chunk_length ({self.config.output_chunk_length}) during forecast."
+                    "Error: 'exog' is enabled during training, "
+                    f"but horizon ({horizon}) != "
+                    "output_chunk_length "
+                    f"({self.config.output_chunk_length}) "
+                    "during forecast."
                 )
 
         if self.check_point is not None:
-            self.model.load_state_dict(self.check_point["Model"])
+            self.model.load_state_dict(
+                self.check_point["Model"]
+            )
             if (
-                    self.CovariateFusion is not None
-                    and "CovariateFusion" in self.check_point
+                self.CovariateFusion is not None
+                and "CovariateFusion"
+                in self.check_point
             ):
                 self.CovariateFusion.load_state_dict(
-                    self.check_point["CovariateFusion"]
+                    self.check_point[
+                        "CovariateFusion"
+                    ]
                 )
 
         if self.config.norm:
             if exog_data is not None:
-                # scaler series data with scaler1
                 series_values = series.values
-                scaled_series = self.scaler1.transform(series_values)
+                scaled_series = (
+                    self.scaler1.transform(
+                        series_values
+                    )
+                )
 
-                # scaler exog data with scaler2
                 exog_values = exog_data.values
-                scaled_exog = self.scaler2.transform(exog_values)
+                scaled_exog = (
+                    self.scaler2.transform(
+                        exog_values
+                    )
+                )
 
-                # 保证目标列和协变量列的时间跨度长度一致
-                diff = scaled_exog.shape[0] - scaled_series.shape[0]
+                diff = (
+                    scaled_exog.shape[0]
+                    - scaled_series.shape[0]
+                )
                 if diff > 0:
-                    scaled_series = np.pad(scaled_series, ((0, diff), (0, 0)), mode="constant")
-                # Combine scaled data
-                scaled_values = np.concatenate([scaled_series, scaled_exog], axis=1)
+                    scaled_series = np.pad(
+                        scaled_series,
+                        ((0, diff), (0, 0)),
+                        mode="constant",
+                    )
+
+                scaled_values = np.concatenate(
+                    [
+                        scaled_series,
+                        scaled_exog,
+                    ],
+                    axis=1,
+                )
+
                 series = pd.DataFrame(
                     scaled_values,
-                    columns=list(series.columns) + list(exog_data.columns),
+                    columns=(
+                        list(series.columns)
+                        + list(exog_data.columns)
+                    ),
                     index=exog_data.index,
                 )
             else:
                 series = pd.DataFrame(
-                    self.scaler1.transform(series.values),
+                    self.scaler1.transform(
+                        series.values
+                    ),
                     columns=series.columns,
                     index=series.index,
                 )
 
         if self.model is None:
-            raise ValueError("Model not trained. Call the fit() function first.")
+            raise ValueError(
+                "Model not trained. "
+                "Call the fit() function first."
+            )
 
-        # seq_len=1440；horizon:672 两者相加为2112
         config = self.config
-        _, test = split_time(series, len(series) - config.seq_len - horizon)
 
-        test_data_set, test_data_loader = forecasting_data_provider(
-            test, config, timeenc=1, batch_size=1, shuffle=False, drop_last=False
+        _, test = split_time(
+            series,
+            len(series)
+            - config.seq_len
+            - horizon,
         )
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        (
+            test_data_set,
+            test_data_loader,
+        ) = forecasting_data_provider(
+            test,
+            config,
+            timeenc=1,
+            batch_size=1,
+            shuffle=False,
+            drop_last=False,
+        )
+
+        device = torch.device(
+            "cuda" if torch.cuda.is_available()
+            else "cpu"
+        )
+
         self.model.to(device)
         self.model.eval()
+
         if self.CovariateFusion is not None:
             self.CovariateFusion.to(device)
             self.CovariateFusion.eval()
+
         with torch.no_grad():
             answer = None
-            while answer is None or answer.shape[0] < horizon:
-                for input, target, input_mark, target_mark in test_data_loader:
+
+            while (
+                answer is None
+                or answer.shape[0] < horizon
+            ):
+                for (
+                    input,
+                    target,
+                    input_mark,
+                    target_mark,
+                ) in test_data_loader:
                     input, target, input_mark, target_mark = (
                         input.to(device),
                         target.to(device),
                         input_mark.to(device),
                         target_mark.to(device),
                     )
-                    exog_future = target[:, -config.horizon:, series_dim:]
-                    out_loss = self._process(
-                        input, target, input_mark, target_mark, exog_future
+
+                    exog_future = target[
+                        :, -config.horizon:, series_dim:
+                    ]
+
+                    hct_pack = (
+                        self._make_hct_context_pack(
+                            query_contexts=input[
+                                :, :, :series_dim
+                            ],
+                            device=device,
+                        )
                     )
+
+                    if hct_pack is None:
+                        out_loss = self._process(
+                            input,
+                            target,
+                            input_mark,
+                            target_mark,
+                            exog_future,
+                        )
+                    else:
+                        out_loss = self._process(
+                            input,
+                            target,
+                            input_mark,
+                            target_mark,
+                            exog_future,
+                            hct_pack=hct_pack,
+                        )
+
                     output = out_loss["output"]
+
                     if self.CovariateFusion is not None:
-                        output = output[:, -config.horizon:, :series_dim]
-                        output = self.CovariateFusion(exog_future, output)
+                        output = output[
+                            :,
+                            -config.horizon:,
+                            :series_dim,
+                        ]
+                        output = (
+                            self.CovariateFusion(
+                                exog_future,
+                                output,
+                            )
+                        )
                         break
                     else:
-                        output = output[:, -config.horizon:, :series_dim]
+                        output = output[
+                            :,
+                            -config.horizon:,
+                            :series_dim,
+                        ]
                         break
 
                 column_num = output.shape[-1]
-                temp = output.cpu().numpy().reshape(-1, column_num)[-config.horizon:]
+                temp = (
+                    output.cpu()
+                    .numpy()
+                    .reshape(-1, column_num)[
+                        -config.horizon:
+                    ]
+                )
 
                 if answer is None:
                     answer = temp
                 else:
-                    answer = np.concatenate([answer, temp], axis=0)
+                    answer = np.concatenate(
+                        [answer, temp],
+                        axis=0,
+                    )
 
                 if answer.shape[0] >= horizon:
                     if self.config.norm:
-                        answer[-horizon:] = self.scaler1.inverse_transform(
-                            answer[-horizon:]
+                        answer[-horizon:] = (
+                            self.scaler1.inverse_transform(
+                                answer[-horizon:]
+                            )
                         )
-                    return answer[-horizon:, :series_dim]
+                    return answer[
+                        -horizon:,
+                        :series_dim,
+                    ]
 
-                output = output.cpu().numpy()[:, -config.horizon:]
+                output = (
+                    output.cpu()
+                    .numpy()[
+                        :,
+                        -config.horizon:,
+                    ]
+                )
+
                 for i in range(config.horizon):
-                    test.iloc[i + config.seq_len, :series_dim] = output[0, i, :]
+                    test.iloc[
+                        i + config.seq_len,
+                        :series_dim,
+                    ] = output[0, i, :]
 
-                test = test.iloc[config.horizon:]
-                # 2112-336=1776
-                test = self.padding_data_for_forecast(test)
+                test = test.iloc[
+                    config.horizon:
+                ]
+                test = (
+                    self.padding_data_for_forecast(
+                        test
+                    )
+                )
 
-                test_data_set, test_data_loader = forecasting_data_provider(
+                (
+                    test_data_set,
+                    test_data_loader,
+                ) = forecasting_data_provider(
                     test,
                     config,
                     timeenc=1,
@@ -1004,105 +1390,238 @@ class DeepForecastingModelBase(ModelBase):
                 )
 
     def batch_forecast(
-        self, horizon: int, batch_maker: BatchMaker, exog_futures, i, **kwargs
+        self,
+        horizon: int,
+        batch_maker: BatchMaker,
+        exog_futures,
+        i,
+        **kwargs,
     ) -> np.ndarray:
         """
         Make predictions by batch.
 
-        :param horizon: The length of each prediction.
-        :param batch_maker: Make batch data used for prediction.
-        :param exog_futures: Future exogenous data used for prediction.
-        :i: The index of the batch.
-        :return: An array of predicted results.
+        HCT retrieval uses the current normalized batch context directly.
+        The historical candidate bank remains frozen from forecast_fit().
         """
         if self.check_point is not None:
-            self.model.load_state_dict(self.check_point["Model"])
+            self.model.load_state_dict(
+                self.check_point["Model"]
+            )
             if self.CovariateFusion is not None:
                 self.CovariateFusion.load_state_dict(
-                    self.check_point["CovariateFusion"]
+                    self.check_point[
+                        "CovariateFusion"
+                    ]
                 )
+
         if self.model is None:
-            raise ValueError("Model not trained. Call the fit() function first.")
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            raise ValueError(
+                "Model not trained. "
+                "Call the fit() function first."
+            )
+
+        device = torch.device(
+            "cuda" if torch.cuda.is_available()
+            else "cpu"
+        )
+
         self.model.to(device)
         self.model.eval()
+
         if self.CovariateFusion is not None:
             self.CovariateFusion.to(device)
             self.CovariateFusion.eval()
 
-        input_data = batch_maker.make_batch(self.config.batch_size, self.config.seq_len)
+        input_data = batch_maker.make_batch(
+            self.config.batch_size,
+            self.config.seq_len,
+        )
+
         input_np = input_data["input"]
         series_dim = input_np.shape[-1]
         batch_size = self.config.batch_size
+
         if input_data["covariates"] is None:
             covariates = {}
         else:
             covariates = input_data["covariates"]
+
         exog_data = covariates.get("exog")
+
         if exog_data is not None:
             exog_dim = exog_data.shape[-1]
-            input_np = np.concatenate((input_np, exog_data), axis=2)
+            input_np = np.concatenate(
+                (input_np, exog_data),
+                axis=2,
+            )
+
             if (
-                hasattr(self.config, "output_chunk_length")
-                and horizon != self.config.output_chunk_length
+                hasattr(
+                    self.config,
+                    "output_chunk_length",
+                )
+                and horizon
+                != self.config.output_chunk_length
             ):
                 raise ValueError(
-                    f"Error: 'exog' is enabled during training, but horizon ({horizon}) != output_chunk_length ({self.config.output_chunk_length}) during forecast."
+                    "Error: 'exog' is enabled during training, "
+                    f"but horizon ({horizon}) != "
+                    "output_chunk_length "
+                    f"({self.config.output_chunk_length}) "
+                    "during forecast."
                 )
         else:
             exog_dim = 0
+
         if self.config.norm:
             if exog_dim > 0:
-                # Scale series data with scaler1
-                series_data = input_np[..., :series_dim]
+                series_data = input_np[
+                    ...,
+                    :series_dim,
+                ]
                 origin_shape1 = series_data.shape
-                flattened_data = series_data.reshape((-1, series_data.shape[-1]))
-                series_data = self.scaler1.transform(flattened_data).reshape(
-                    origin_shape1
-                )
-                # Scale exog data with scaler2
-                exog_data = input_np[..., series_dim:]
-                origin_shape2 = exog_data.shape
-                flattened_data = exog_data.reshape((-1, exog_data.shape[-1]))
-                exog_data = self.scaler2.transform(flattened_data).reshape(
-                    origin_shape2
+
+                flattened_data = (
+                    series_data.reshape(
+                        (
+                            -1,
+                            series_data.shape[-1],
+                        )
+                    )
                 )
 
-                input_np = np.concatenate((series_data, exog_data), axis=2)
+                series_data = (
+                    self.scaler1.transform(
+                        flattened_data
+                    ).reshape(origin_shape1)
+                )
+
+                exog_data = input_np[
+                    ...,
+                    series_dim:,
+                ]
+                origin_shape2 = exog_data.shape
+
+                flattened_data = (
+                    exog_data.reshape(
+                        (
+                            -1,
+                            exog_data.shape[-1],
+                        )
+                    )
+                )
+
+                exog_data = (
+                    self.scaler2.transform(
+                        flattened_data
+                    ).reshape(origin_shape2)
+                )
+
+                input_np = np.concatenate(
+                    (
+                        series_data,
+                        exog_data,
+                    ),
+                    axis=2,
+                )
             else:
                 origin_shape = input_np.shape
-                flattened_data = input_np.reshape((-1, input_np.shape[-1]))
-                input_np = self.scaler1.transform(flattened_data).reshape(origin_shape)
+                flattened_data = (
+                    input_np.reshape(
+                        (
+                            -1,
+                            input_np.shape[-1],
+                        )
+                    )
+                )
+                input_np = (
+                    self.scaler1.transform(
+                        flattened_data
+                    ).reshape(origin_shape)
+                )
 
-        # 传入exog_futures,每个batch中对应的未来协变量
         if exog_futures is not None:
             exog_future = torch.tensor(
-                exog_futures[i * batch_size : (i + 1) * batch_size, -horizon:, :]
+                exog_futures[
+                    i * batch_size :
+                    (i + 1) * batch_size,
+                    -horizon:,
+                    :,
+                ]
             ).to(device)
         else:
             exog_future = None
 
-        if self.config.norm and exog_dim > 0:
-            flattened_data = exog_future.reshape((-1, exog_future.shape[-1]))
-            flattened_data_np = flattened_data.cpu().numpy()
-            exog_future = self.scaler2.transform(flattened_data_np).reshape(
-                exog_future.shape
+        if (
+            self.config.norm
+            and exog_dim > 0
+            and exog_future is not None
+        ):
+            flattened_data = (
+                exog_future.reshape(
+                    (
+                        -1,
+                        exog_future.shape[-1],
+                    )
+                )
             )
-            exog_future = torch.tensor(exog_future).to(device)
-        input_index = input_data["time_stamps"]
-        padding_len = (
-            math.ceil(horizon / self.config.horizon) + 1
-        ) * self.config.horizon
-        all_mark = self._padding_time_stamp_mark(input_index, padding_len)
+            flattened_data_np = (
+                flattened_data.cpu().numpy()
+            )
 
-        answers = self._perform_rolling_predictions(
-            horizon, input_np, exog_future, series_dim, all_mark, device
+            exog_future = (
+                self.scaler2.transform(
+                    flattened_data_np
+                ).reshape(
+                    exog_future.shape
+                )
+            )
+
+            exog_future = torch.tensor(
+                exog_future
+            ).to(device)
+
+        input_index = input_data["time_stamps"]
+
+        padding_len = (
+            math.ceil(
+                horizon
+                / self.config.horizon
+            )
+            + 1
+        ) * self.config.horizon
+
+        all_mark = (
+            self._padding_time_stamp_mark(
+                input_index,
+                padding_len,
+            )
+        )
+
+        answers = (
+            self._perform_rolling_predictions(
+                horizon,
+                input_np,
+                exog_future,
+                series_dim,
+                all_mark,
+                device,
+            )
         )
 
         if self.config.norm:
-            flattened_data = answers.reshape((-1, answers.shape[-1]))
-            answers = self.scaler1.inverse_transform(flattened_data).reshape(
-                answers.shape
+            flattened_data = answers.reshape(
+                (
+                    -1,
+                    answers.shape[-1],
+                )
+            )
+            answers = (
+                self.scaler1.inverse_transform(
+                    flattened_data
+                ).reshape(
+                    answers.shape
+                )
             )
 
         return answers[..., :series_dim]
@@ -1117,86 +1636,217 @@ class DeepForecastingModelBase(ModelBase):
         device: torch.device,
     ) -> list:
         """
-        Perform rolling predictions using the given input data and marks.
+        Perform rolling predictions.
 
-        :param horizon: Length of predictions to be made.
-        :param input_np: Numpy array of input data.
-        :param exog_future: Future exogenous data used for prediction.
-        :param series_dim: Dimension of the series data.
-        :param all_mark: Numpy array of all marks (time stamps mark).
-        :param device: Device to run the model on.
-        :return: List of predicted results for each prediction batch.
+        For every rolling step, HCT retrieves from the frozen historical
+        candidate bank using the current endogenous context in input_np.
         """
         rolling_time = 0
-        input_np, target_np, input_mark_np, target_mark_np = self._get_rolling_data(
-            input_np, None, all_mark, rolling_time
+
+        (
+            input_np,
+            target_np,
+            input_mark_np,
+            target_mark_np,
+        ) = self._get_rolling_data(
+            input_np,
+            None,
+            all_mark,
+            rolling_time,
         )
+
         if exog_future is not None:
-            rolling_time_sum = horizon // self.config.horizon + 1
-            need_horizon = rolling_time_sum * self.config.horizon - horizon
+            rolling_time_sum = (
+                horizon // self.config.horizon
+                + 1
+            )
+            need_horizon = (
+                rolling_time_sum
+                * self.config.horizon
+                - horizon
+            )
+
             exog_future = torch.cat(
                 (
                     exog_future,
                     torch.zeros(
-                        (exog_future.shape[0], need_horizon, exog_future.shape[-1])
+                        (
+                            exog_future.shape[0],
+                            need_horizon,
+                            exog_future.shape[-1],
+                        )
                     ).to(device),
                 ),
                 dim=1,
             )
             exog_future = exog_future.float()
+
         with torch.no_grad():
             answers = []
-            while not answers or sum(a.shape[1] for a in answers) < horizon:
-                input, dec_input, input_mark, target_mark = (
-                    torch.tensor(input_np, dtype=torch.float32).to(device),
-                    torch.tensor(target_np, dtype=torch.float32).to(device),
-                    torch.tensor(input_mark_np, dtype=torch.float32).to(device),
-                    torch.tensor(target_mark_np, dtype=torch.float32).to(device),
+
+            while (
+                not answers
+                or sum(
+                    a.shape[1]
+                    for a in answers
+                ) < horizon
+            ):
+                # HCT retrieval is intentionally done on CPU from input_np.
+                hct_pack = (
+                    self._make_hct_context_pack(
+                        query_contexts=input_np[
+                            ...,
+                            :series_dim,
+                        ],
+                        device=device,
+                    )
                 )
+
+                (
+                    input,
+                    dec_input,
+                    input_mark,
+                    target_mark,
+                ) = (
+                    torch.tensor(
+                        input_np,
+                        dtype=torch.float32,
+                    ).to(device),
+                    torch.tensor(
+                        target_np,
+                        dtype=torch.float32,
+                    ).to(device),
+                    torch.tensor(
+                        input_mark_np,
+                        dtype=torch.float32,
+                    ).to(device),
+                    torch.tensor(
+                        target_mark_np,
+                        dtype=torch.float32,
+                    ).to(device),
+                )
+
                 if exog_future is not None:
                     exog_future1 = exog_future[
                         :,
                         rolling_time
-                        * self.config.horizon : (rolling_time + 1)
+                        * self.config.horizon :
+                        (rolling_time + 1)
                         * self.config.horizon,
                         :,
                     ]
                 else:
                     exog_future1 = None
-                out_loss = self._process(
-                    input, dec_input, input_mark, target_mark, exog_future1
-                )
-                output = out_loss["output"]
-                if self.CovariateFusion is not None and exog_future is not None:
-                    output1 = output[:, -self.config.horizon :, :series_dim]
-                    output1 = self.CovariateFusion(exog_future1, output1)
+
+                if hct_pack is None:
+                    out_loss = self._process(
+                        input,
+                        dec_input,
+                        input_mark,
+                        target_mark,
+                        exog_future1,
+                    )
                 else:
-                    output1 = output[:, -self.config.horizon :, :series_dim]
+                    out_loss = self._process(
+                        input,
+                        dec_input,
+                        input_mark,
+                        target_mark,
+                        exog_future1,
+                        hct_pack=hct_pack,
+                    )
+
+                output = out_loss["output"]
+
+                if (
+                    self.CovariateFusion
+                    is not None
+                    and exog_future
+                    is not None
+                ):
+                    output1 = output[
+                        :,
+                        -self.config.horizon:,
+                        :series_dim,
+                    ]
+                    output1 = (
+                        self.CovariateFusion(
+                            exog_future1,
+                            output1,
+                        )
+                    )
+                else:
+                    output1 = output[
+                        :,
+                        -self.config.horizon:,
+                        :series_dim,
+                    ]
+
                 column_num = output.shape[-1]
                 real_batch_size = output.shape[0]
+
                 output = torch.cat(
-                    [output1, output[:, -self.config.horizon :, series_dim:]], dim=-1
+                    [
+                        output1,
+                        output[
+                            :,
+                            -self.config.horizon:,
+                            series_dim:,
+                        ],
+                    ],
+                    dim=-1,
                 )
+
                 answer = (
                     output.cpu()
                     .numpy()
-                    .reshape(real_batch_size, -1, column_num)[
-                        :, -self.config.horizon :, :
+                    .reshape(
+                        real_batch_size,
+                        -1,
+                        column_num,
+                    )[
+                        :,
+                        -self.config.horizon:,
+                        :,
                     ]
                 )
+
                 answers.append(answer)
-                if sum(a.shape[1] for a in answers) >= horizon:
+
+                if sum(
+                    a.shape[1]
+                    for a in answers
+                ) >= horizon:
                     break
+
                 rolling_time += 1
-                output = output.cpu().numpy()[:, -self.config.horizon :, :]
+
+                output = (
+                    output.cpu()
+                    .numpy()[
+                        :,
+                        -self.config.horizon:,
+                        :,
+                    ]
+                )
+
                 (
                     input_np,
                     target_np,
                     input_mark_np,
                     target_mark_np,
-                ) = self._get_rolling_data(input_np, output, all_mark, rolling_time)
+                ) = self._get_rolling_data(
+                    input_np,
+                    output,
+                    all_mark,
+                    rolling_time,
+                )
 
-        answers = np.concatenate(answers, axis=1)
+        answers = np.concatenate(
+            answers,
+            axis=1,
+        )
+
         return answers[:, -horizon:, :]
 
     def _get_rolling_data(

@@ -38,6 +38,8 @@ MODEL_HYPER_PARAMS = {
     "hct_topk": 5,
     "hct_memory_stride": 12,
     "hct_bins": 24,
+    "hct_dim": 128,
+    "hct_seed": 2026,
 
 }
 
